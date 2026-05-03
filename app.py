@@ -20,6 +20,7 @@ import faiss
 import numpy as np
 from pypdf import PdfReader
 import os
+import traceback
 
 # ============================================================
 # SECTION 1: PDF TEXT EXTRACTION
@@ -46,42 +47,22 @@ def extract_text_from_pdf(pdf_file):
 # ============================================================
 # SECTION 2: TEXT CHUNKING
 # ============================================================
-def chunk_text(text, chunk_size=500, overlap=50):
-    """
-    Split text into overlapping chunks for better retrieval.
-    
-    Args:
-        text: Full text to split
-        chunk_size: Approximate characters per chunk
-        overlap: Number of overlapping characters between chunks
-        
-    Returns:
-        list: List of text chunks
-    """
+def chunk_text(text, chunk_size=300, overlap=50):
     chunks = []
     start = 0
     text_length = len(text)
-    
+
     while start < text_length:
-        # Find the end of the chunk
-        end = start + chunk_size
-        
-        # If we're not at the end, try to break at a sentence boundary
-        if end < text_length:
-            # Look for sentence endings near the chunk boundary
-            for punct in ['. ', '! ', '? ', '\n']:
-                last_punct = text.rfind(punct, start, end)
-                if last_punct > start:
-                    end = last_punct + 1
-        
-        # Get the chunk
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        
-        # Move to next chunk with overlap
-        start = end - overlap
-    
+        end = min(start + chunk_size, text_length)
+        chunk = text[start:end]
+        chunks.append(chunk)
+
+        start += chunk_size - overlap
+
+        # Prevent too many chunks (memory safety)
+        if len(chunks) > 1000:
+            break
+
     return chunks
 
 
@@ -224,46 +205,53 @@ def load_knowledge_base(folder="knowledge_base"):
 # SECTION 5: QUESTION ANSWERING
 # ============================================================
 @st.cache_resource
-def load_qa_model():
+def load_llm():
     """
-    Load a free QA model from HuggingFace.
-    Uses 'deepset/roberta-base-squad2' - a more powerful QA model.
-    This provides better answer quality than DistilBERT.
+    Load a lightweight text generation model for QA.
+    Uses distilgpt2 for stable on-device generation.
     
     Returns:
-        pipeline: Question answering pipeline
+        pipeline: Text generation pipeline
     """
-    model_name = "deepset/roberta-base-squad2"
-    return pipeline("question-answering", model=model_name, tokenizer=model_name)
+    return pipeline(
+        "text-generation",
+        model="distilgpt2",
+        max_new_tokens=100
+    )
 
 
-def generate_answer(question, context_chunks, qa_pipeline):
+def generate_answer(question, context_chunks, llm):
     """
     Generate an answer based on the retrieved context.
     
     Args:
         question: User's question
         context_chunks: Retrieved relevant text
-        qa_pipeline: QA model pipeline
+        llm: Text generation pipeline
         
     Returns:
         str: Generated answer
     """
-    # Combine context chunks
-    context = "\n\n".join(context_chunks)
-    
-    # Truncate context if too long (QA model has max input length)
-    if len(context) > 2000:
-        context = context[:2000]
-    
-    # Get answer from QA model
-    result = qa_pipeline(
-        question=question,
-        context=context,
-        max_answer_len=150
-    )
-    
-    return result['answer']
+    # Combine top chunks into context
+    context = " ".join(context_chunks[:3])
+
+    prompt = f"""
+Answer the question based on the context below:
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+    result = llm(prompt)
+    answer = result[0]["generated_text"]
+    answer = answer.split("Answer:")[-1].strip()
+
+    return answer
 
 
 # ============================================================
@@ -296,8 +284,8 @@ def main():
         st.session_state.index = None
     if 'embedding_model' not in st.session_state:
         st.session_state.embedding_model = None
-    if 'qa_model' not in st.session_state:
-        st.session_state.qa_model = None
+    if 'llm' not in st.session_state:
+        st.session_state.llm = None
     if 'processed_files' not in st.session_state:
         st.session_state.processed_files = []  # Store list of processed file names
     if 'chat_history' not in st.session_state:
@@ -309,6 +297,12 @@ def main():
     with st.sidebar:
         st.header("📄 Upload PDFs")
         st.markdown("Upload one or more PDF documents to create your knowledge base.")
+
+        uploaded_files = st.file_uploader(
+            "Upload PDF files",
+            type=["pdf"],
+            accept_multiple_files=True
+        )
         
         # Check for saved knowledge base
         saved_kb = load_knowledge_base()
@@ -324,18 +318,11 @@ def main():
                     # Load models
                     embedding_model = load_embedding_model()
                     st.session_state.embedding_model = embedding_model
-                    qa_model = load_qa_model()
-                    st.session_state.qa_model = qa_model
+                    llm = load_llm()
+                    st.session_state.llm = llm
                     
                     st.success(f"✅ Loaded {len(processed_files)} documents with {len(chunks)} chunks!")
                     st.rerun()
-        
-        uploaded_files = st.file_uploader(
-            "Choose PDF files",
-            type=['pdf'],
-            accept_multiple_files=True,
-            help="Upload multiple PDF files to combine their content"
-        )
         
         # Process button
         if uploaded_files is not None and len(uploaded_files) > 0:
@@ -357,6 +344,9 @@ def main():
                         if not all_text.strip():
                             st.error("Could not extract text from any PDF. Files might be image-based.")
                             st.stop()
+                        
+                        # Limit text size for memory safety
+                        all_text = all_text[:50000]
                         
                         st.success(f"Extracted text from {len(processed_files)} files ({len(all_text)} characters)")
                         
@@ -385,15 +375,16 @@ def main():
                         st.info("💾 Saving knowledge base...")
                         save_knowledge_base(chunks, index, processed_files)
                         
-                        # Step 6: Load QA model
-                        st.info("🤖 Loading QA model...")
-                        qa_model = load_qa_model()
-                        st.session_state.qa_model = qa_model
+                        # Step 6: Load LLM
+                        st.info("🤖 Loading LLM...")
+                        llm = load_llm()
+                        st.session_state.llm = llm
                         
                         st.success("✅ PDFs processed successfully!")
                         
                     except Exception as e:
-                        st.error(f"Error processing PDF: {str(e)}")
+                        st.error(f"Error: {str(e)}")
+                        st.text(traceback.format_exc())
         
         # Show processing status
         if st.session_state.processed_files:
@@ -449,6 +440,10 @@ def main():
             if not question.strip():
                 st.warning("Please enter a question!")
             else:
+                llm = st.session_state.llm
+                if llm is None:
+                    st.error("QA model failed to load.")
+                    return
                 with st.spinner("Finding relevant information..."):
                     try:
                         relevant_chunks = retrieve_relevant_chunks(
@@ -462,14 +457,14 @@ def main():
                             answer = generate_answer(
                                 question,
                                 relevant_chunks,
-                                st.session_state.qa_model
+                                llm
                             )
                         st.session_state.chat_history.append({
                             'question': question,
                             'answer': answer,
                             'sources': relevant_chunks
                         })
-                        st.experimental_rerun()
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Error generating answer: {str(e)}")
         st.divider()
