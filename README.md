@@ -38,17 +38,9 @@ KnowFlow is an AI-powered knowledge base application that allows users to upload
 ## ▶️ How to Run
 
 ```bash
-git clone https://github.com/your-username/KnowFlow.git
+git clone https://github.com/pranavika24/KnowFlow.git
 cd KnowFlow
 pip install -r requirements.txt
 streamlit run app.py
 
-
-
----
-
-# ⚠️ Replace this line
-
-```md
-git clone https://github.com/pranavika24/KnowFlow.git
 
